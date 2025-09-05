@@ -1,0 +1,1465 @@
+#!pip install dash plotly yfinance pandas numpy
+#如果卡環境可以裝
+
+#from google.colab import files
+#uploaded = files.upload()
+
+import pandas as pd
+import dash
+from dash import dcc, html, callback
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import yfinance as yf
+import numpy as np
+from plotly.subplots import make_subplots
+import os
+
+# 安裝必要套件 (在 Colab 中執行)
+# !pip install dash plotly yfinance pandas numpy
+
+# 台股代號對應表
+TAIWAN_STOCKS = {
+    '台指期': 'TXF=F',  # 台指期貨
+    '台積電': '2330.TW',
+    '聯發科': '2454.TW',
+    '鴻海': '2317.TW',
+    '台塑': '1301.TW',
+    '中華電': '2412.TW',
+    '富邦金': '2881.TW',
+    '國泰金': '2882.TW',
+    '台達電': '2308.TW',
+    '統一': '1216.TW',
+    '日月光': '2311.TW',
+    '長榮': '2306.TW',
+    '慧洋-KY': '2637.TW',
+    '上銀' : '2049.TW',
+    '台泥' : '1101.TW',
+    '譜瑞-KY' :'4966.TW',
+    '貿聯-KY' :'3665.TW'
+}
+
+# 產業分類
+INDUSTRY_MAPPING = {
+    '2330.TW': '半導體',
+    '2454.TW': '半導體',
+    '2317.TW': '電子組件',
+    '1301.TW': '塑膠',
+    '2412.TW': '電信',
+    '2881.TW': '金融',
+    '2882.TW': '金融',
+    '2308.TW': '電子',
+    '1216.TW': '食品',
+    '2311.TW': '半導體',
+    '2306.TW': '航運',
+    '2637.TW': '散裝航運',
+    '2049.TW' : '工具機',
+    '1101.TW' : '營建',
+    '4966.TW' :'高速傳輸',
+    '3665.TW' :'連接器'
+}
+
+def get_stock_data(symbol, period='1y'):
+    """獲取股票資料"""
+    try:
+        stock = yf.Ticker(symbol)
+        data = stock.history(period=period)
+
+        # 如果台指期資料為空，嘗試替代方案
+        if data.empty and symbol == 'TXF=F':
+            # 嘗試使用台灣50ETF作為替代
+            stock = yf.Ticker('0050.TW')
+            data = stock.history(period=period)
+            if data.empty:
+                # 最後嘗試使用加權指數
+                stock = yf.Ticker('^TWII')
+                data = stock.history(period=period)
+
+        return data
+    except:
+        return pd.DataFrame()
+
+def create_lstm_dataset(data, time_step=60):
+    """建立LSTM訓練資料集"""
+    X, y = [], []
+    for i in range(time_step, len(data)):
+        X.append(data[i-time_step:i, 0])
+        y.append(data[i, 0])
+    return np.array(X), np.array(y)
+
+def simple_lstm_predict(data, predict_days=5):
+    """簡化的LSTM預測模型 (使用統計方法模擬)"""
+    if len(data) < 60:
+        return None
+
+    # 使用移動平均和趨勢分析來模擬深度學習預測
+    prices = data['Close'].values
+
+    # 計算短期和長期移動平均
+    ma_short = np.mean(prices[-5:])
+    ma_medium = np.mean(prices[-20:])
+    ma_long = np.mean(prices[-60:])
+
+    # 計算價格變化趨勢
+    recent_trend = np.polyfit(range(20), prices[-20:], 1)[0]
+    volatility = np.std(prices[-20:]) / np.mean(prices[-20:])
+
+    # 模擬預測邏輯
+    base_change = recent_trend * predict_days
+    trend_factor = 1.0
+
+    if ma_short > ma_medium > ma_long:
+        trend_factor = 1.02  # 上升趨勢
+    elif ma_short < ma_medium < ma_long:
+        trend_factor = 0.98  # 下降趨勢
+    else:
+        trend_factor = 1.0   # 盤整
+
+    # 加入隨機性模擬市場不確定性
+    noise_factor = np.random.normal(1, volatility * 0.1)
+
+    predicted_price = prices[-1] * trend_factor + base_change + (prices[-1] * noise_factor * 0.01)
+    change_pct = ((predicted_price - prices[-1]) / prices[-1]) * 100
+
+    return {
+        'predicted_price': predicted_price,
+        'change_pct': change_pct,
+        'confidence': max(0.6, 1 - volatility * 2)  # 基於波動率的信心度
+    }
+
+def calculate_technical_indicators(df):
+    """計算技術指標"""
+    if df.empty:
+        return df
+
+    # 移動平均線
+    df['MA5'] = df['Close'].rolling(window=5).mean()
+    df['MA20'] = df['Close'].rolling(window=20).mean()
+
+    # RSI
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # MACD (12, 26, 9)
+    exp1 = df['Close'].ewm(span=12).mean()
+    exp2 = df['Close'].ewm(span=26).mean()
+    df['MACD'] = exp1 - exp2
+    df['MACD_Signal'] = df['MACD'].ewm(span=9).mean()
+    df['MACD_Histogram'] = df['MACD'] - df['MACD_Signal']
+
+    # 布林通道 (20日, 2倍標準差)
+    df['BB_Middle'] = df['Close'].rolling(window=20).mean()
+    bb_std = df['Close'].rolling(window=20).std()
+    df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
+    df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
+    df['BB_Width'] = df['BB_Upper'] - df['BB_Lower']
+    df['BB_Position'] = (df['Close'] - df['BB_Lower']) / (df['BB_Upper'] - df['BB_Lower'])
+
+    # KD指標 (9, 3, 3)
+    low_min = df['Low'].rolling(window=9).min()
+    high_max = df['High'].rolling(window=9).max()
+    rsv = (df['Close'] - low_min) / (high_max - low_min) * 100
+    df['K'] = rsv.ewm(com=2).mean()  # com=2 相當於 span=3
+    df['D'] = df['K'].ewm(com=2).mean()
+
+    # 威廉指標 %R (14日)
+    low_min_14 = df['Low'].rolling(window=14).min()
+    high_max_14 = df['High'].rolling(window=14).max()
+    df['Williams_R'] = -100 * (high_max_14 - df['Close']) / (high_max_14 - low_min_14)
+
+    return df
+
+def get_business_climate_data():
+    """獲取台灣景氣燈號資料"""
+    try:
+        # 檢查檔案是否存在
+        if not os.path.exists('business_climate.csv'):
+            print("business_climate.csv 檔案不存在")
+            return pd.DataFrame()
+
+        # 讀取CSV檔案，假設列名為 Date 和 Index
+        df = pd.read_csv('business_climate.csv')
+
+        # 檢查列名並調整
+        if 'Date' not in df.columns:
+            # 如果第一列是日期，重新命名
+            df.columns = ['Date', 'Index'] if len(df.columns) == 2 else df.columns
+
+        # 轉換日期格式 (處理 YYYY-MM 格式)
+        if 'Date' in df.columns:
+            try:
+                # 如果是 YYYY-MM 格式，轉換為日期
+                df['Date'] = pd.to_datetime(df['Date'] + '-01', format='%Y-%m-%d', errors='coerce')
+            except:
+                df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+
+        # 移除日期轉換失敗的行
+        df = df.dropna(subset=['Date'])
+
+        print(f"成功讀取景氣燈號資料：{len(df)} 筆記錄")
+        return df
+
+    except Exception as e:
+        print(f"無法獲取景氣燈號資料: {str(e)}")
+        return pd.DataFrame()
+
+def get_pmi_data():
+    """獲取台灣 PMI 資料"""
+    try:
+        # 檢查檔案是否存在
+        if not os.path.exists('taiwan_pmi.csv'):
+            print("taiwan_pmi.csv 檔案不存在")
+            return pd.DataFrame()
+
+        # 讀取CSV檔案
+        df = pd.read_csv('taiwan_pmi.csv')
+
+        # 檢查列名並調整 (處理 DATE/INDEX 或其他可能的列名)
+        if 'DATE' in df.columns:
+            df = df.rename(columns={'DATE': 'Date', 'INDEX': 'Index'})
+        elif len(df.columns) == 2:
+            df.columns = ['Date', 'Index']
+
+        # 轉換日期格式
+        if 'Date' in df.columns:
+            try:
+                # 如果是 YYYY-MM 格式，轉換為日期
+                df['Date'] = pd.to_datetime(df['Date'] + '-01', format='%Y-%m-%d', errors='coerce')
+            except:
+                df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+
+        # 移除日期轉換失敗的行
+        df = df.dropna(subset=['Date'])
+
+        print(f"成功讀取 PMI 資料：{len(df)} 筆記錄")
+        return df
+
+    except Exception as e:
+        print(f"無法獲取 PMI 資料: {str(e)}")
+        return pd.DataFrame()
+
+# 建立 Dash 應用程式
+app = dash.Dash(__name__, suppress_callback_exceptions=True)
+
+# 應用程式佈局
+app.layout = html.Div([
+    html.H1("台股分析儀表板", style={'text-align': 'center', 'margin-bottom': '30px'}),
+
+    # 控制面板
+    html.Div([
+        html.Div([
+            html.Label("選擇股票:"),
+            dcc.Dropdown(
+                id='stock-dropdown',
+                options=[{'label': name, 'value': symbol} for name, symbol in TAIWAN_STOCKS.items()],
+                value='TXF=F',
+                style={'margin-bottom': '10px'}
+            )
+        ], style={'width': '30%', 'display': 'inline-block', 'vertical-align': 'top'}),
+
+        html.Div([
+            html.Label("時間範圍:"),
+            dcc.Dropdown(
+                id='period-dropdown',
+                options=[
+                    {'label': '1個月', 'value': '1mo'},
+                    {'label': '3個月', 'value': '3mo'},
+                    {'label': '6個月', 'value': '6mo'},
+                    {'label': '1年', 'value': '1y'},
+                    {'label': '2年', 'value': '2y'}
+                ],
+                value='6mo',
+                style={'margin-bottom': '10px'}
+            )
+        ], style={'width': '30%', 'display': 'inline-block', 'margin-left': '5%', 'vertical-align': 'top'}),
+
+        html.Div([
+            html.Label("圖表類型:"),
+            dcc.Dropdown(
+                id='chart-type',
+                options=[
+                    {'label': '線圖', 'value': 'line'},
+                    {'label': '蠟燭圖', 'value': 'candlestick'}
+                ],
+                value='candlestick',
+                style={'margin-bottom': '10px'}
+            )
+        ], style={'width': '30%', 'display': 'inline-block', 'margin-left': '5%', 'vertical-align': 'top'})
+    ], style={'margin-bottom': '30px'}),
+
+    # 股價資訊卡片
+    html.Div(id='stock-info-cards', style={'margin-bottom': '30px'}),
+
+    # AI預測區塊 (只在選擇台指期時顯示)
+    html.Div(id='prediction-section', style={'margin-bottom': '30px'}),
+
+    # 主要圖表區域
+    html.Div([
+        # 左側：股價走勢圖和技術指標
+        html.Div([
+            html.Div([
+                dcc.Graph(id='price-chart')
+            ], style={'margin-bottom': '20px'}),
+
+            html.Div([
+                dcc.Graph(id='rsi-chart')
+            ])
+        ], style={'width': '65%', 'display': 'inline-block', 'vertical-align': 'top'}),
+
+        # 右側：分析資訊面板
+        html.Div([
+            html.Div(id='analysis-panel')
+        ], style={'width': '33%', 'display': 'inline-block', 'margin-left': '2%', 'vertical-align': 'top'})
+    ]),
+
+    # 技術指標選擇區域
+    html.Div([
+        html.H3("📊 進階技術指標分析", style={'margin-bottom': '20px'}),
+        html.Div([
+            html.Label("選擇技術指標:", style={'font-weight': 'bold', 'margin-right': '10px'}),
+            dcc.Dropdown(
+                id='technical-indicator-selector',
+                options=[
+                    {'label': 'RSI 相對強弱指標', 'value': 'RSI'},
+                    {'label': 'MACD 指數平滑異同移動平均線', 'value': 'MACD'},
+                    {'label': '布林通道 Bollinger Bands', 'value': 'BB'},
+                    {'label': 'KD 隨機指標', 'value': 'KD'},
+                    {'label': '威廉指標 %R', 'value': 'WR'}
+                ],
+                value='RSI',
+                style={'width': '100%'}
+            )
+        ], style={'margin-bottom': '20px'}),
+
+        html.Div([
+            dcc.Graph(id='advanced-technical-chart')
+        ])
+    ], style={
+        'margin-top': '20px',
+        'padding': '20px',
+        'background': 'white',
+        'border-radius': '10px',
+        'box-shadow': '0 2px 10px rgba(0,0,0,0.1)'
+    }),
+
+    # 成交量圖
+    html.Div([
+        dcc.Graph(id='volume-chart')
+    ], style={'margin-top': '20px'}),
+
+    # 產業分析
+    html.Div([
+        html.H3("產業表現分析"),
+        dcc.Graph(id='industry-analysis')
+    ], style={'margin-top': '30px'}),
+
+    # 分析師觀點區域
+    html.Div([
+        html.H3("📊 分析師觀點與市場解讀", style={'color': '#2E86AB', 'margin-bottom': '20px'}),
+        html.Div([
+            # 左側：技術分析觀點
+            html.Div([
+                html.H4("🔍 技術面分析", style={'color': '#A23B72', 'margin-bottom': '15px'}),
+                html.Div(id='technical-analysis-text', style={
+                    'background': '#f8f9fa',
+                    'padding': '15px',
+                    'border-radius': '8px',
+                    'border-left': '4px solid #A23B72',
+                    'min-height': '150px',
+                    'font-size': '14px',
+                    'line-height': '1.6'
+                })
+            ], style={'width': '48%', 'display': 'inline-block', 'vertical-align': 'top'}),
+
+            # 右側：基本面分析觀點
+            html.Div([
+                html.H4("📈 基本面分析", style={'color': '#F18F01', 'margin-bottom': '15px'}),
+                html.Div(id='fundamental-analysis-text', style={
+                    'background': '#f8f9fa',
+                    'padding': '15px',
+                    'border-radius': '8px',
+                    'border-left': '4px solid #F18F01',
+                    'min-height': '150px',
+                    'font-size': '14px',
+                    'line-height': '1.6'
+                })
+            ], style={'width': '48%', 'display': 'inline-block', 'margin-left': '4%', 'vertical-align': 'top'})
+        ]),
+
+        # 底部：市場展望
+        html.Div([
+            html.H4("🎯 市場展望與投資建議", style={'color': '#C73E1D', 'margin-bottom': '15px', 'margin-top': '25px'}),
+            html.Div(id='market-outlook-text', style={
+                'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                'color': 'white',
+                'padding': '20px',
+                'border-radius': '10px',
+                'min-height': '100px',
+                'font-size': '15px',
+                'line-height': '1.7',
+                'box-shadow': '0 4px 15px rgba(0,0,0,0.1)'
+            })
+        ])
+    ], style={
+        'margin-top': '30px',
+        'padding': '25px',
+        'background': 'white',
+        'border-radius': '12px',
+        'box-shadow': '0 4px 20px rgba(0,0,0,0.08)',
+        'border': '1px solid #e9ecef'
+    }),
+
+    # 景氣燈號與 PMI 分析
+    html.Div([
+        html.H3("景氣燈號與 PMI 分析"),
+        html.Div([
+            html.Div([
+                dcc.Graph(id='business-climate-chart')
+            ], style={'width': '48%', 'display': 'inline-block'}),
+            html.Div([
+                dcc.Graph(id='pmi-chart')
+            ], style={'width': '48%', 'display': 'inline-block', 'margin-left': '2%'})
+        ])
+    ], style={'margin-top': '30px'}),
+
+    # 多檔股票比較區域
+    html.Div([
+        html.H3("📊 多檔股票比較分析", style={'margin-bottom': '20px'}),
+        html.Div([
+            html.Div([
+                html.Label("選擇比較股票（最多5檔）:", style={'font-weight': 'bold'}),
+                dcc.Dropdown(
+                    id='comparison-stocks',
+                    options=[{'label': name, 'value': symbol} for name, symbol in TAIWAN_STOCKS.items()],
+                    value=['2330.TW', '2454.TW', '2317.TW'],  # 預設選擇
+                    multi=True,
+                    style={'margin-bottom': '15px'}
+                )
+            ], style={'width': '60%', 'display': 'inline-block'}),
+
+            html.Div([
+                html.Label("比較期間:", style={'font-weight': 'bold'}),
+                dcc.Dropdown(
+                    id='comparison-period',
+                    options=[
+                        {'label': '1個月', 'value': '1mo'},
+                        {'label': '3個月', 'value': '3mo'},
+                        {'label': '6個月', 'value': '6mo'},
+                        {'label': '1年', 'value': '1y'}
+                    ],
+                    value='3mo'
+                )
+            ], style={'width': '35%', 'display': 'inline-block', 'margin-left': '5%'})
+        ]),
+
+        html.Div([
+            html.Div([
+                dcc.Graph(id='comparison-chart')
+            ], style={'width': '65%', 'display': 'inline-block'}),
+
+            html.Div([
+                html.H4("比較結果", style={'color': '#2E86AB'}),
+                html.Div(id='comparison-table')
+            ], style={'width': '33%', 'display': 'inline-block', 'margin-left': '2%', 'vertical-align': 'top'})
+        ])
+    ], style={
+        'margin-top': '30px',
+        'padding': '20px',
+        'background': 'white',
+        'border-radius': '10px',
+        'box-shadow': '0 2px 10px rgba(0,0,0,0.1)'
+    }),
+
+    # 新聞情感分析區域（模擬）
+    html.Div([
+        html.H3("📰 市場情緒與新聞分析", style={'color': '#E74C3C', 'margin-bottom': '20px'}),
+        html.Div([
+            html.Div([
+                html.H4("市場情緒指標", style={'color': '#8E44AD'}),
+                html.Div(id='sentiment-gauge')
+            ], style={'width': '48%', 'display': 'inline-block'}),
+
+            html.Div([
+                html.H4("關鍵新聞摘要", style={'color': '#27AE60'}),
+                html.Div(id='news-summary', style={
+                    'background': '#f8f9fa',
+                    'padding': '15px',
+                    'border-radius': '8px',
+                    'max-height': '200px',
+                    'overflow-y': 'auto'
+                })
+            ], style={'width': '48%', 'display': 'inline-block', 'margin-left': '4%'})
+        ])
+    ], style={
+        'margin-top': '30px',
+        'padding': '20px',
+        'background': 'white',
+        'border-radius': '10px',
+        'box-shadow': '0 2px 10px rgba(0,0,0,0.1)'
+    })
+])
+
+# 更新AI預測區塊
+@app.callback(
+    dash.dependencies.Output('prediction-section', 'children'),
+    [dash.dependencies.Input('stock-dropdown', 'value')],
+    prevent_initial_call=False
+)
+def update_prediction_section(selected_stock):
+    if selected_stock != 'TXF=F':
+        return html.Div()  # 只在選擇台指期時顯示預測功能
+
+    return html.Div([
+        html.H3("🤖 AI深度學習預測 - 台指期指數", style={'text-align': 'center', 'color': '#FFCC22'}),
+        html.Div([
+            html.Div([
+                html.Label("預測期間:", style={'font-weight': 'bold', 'color': '#FFCC22'}),
+                dcc.Dropdown(
+                    id='prediction-period',
+                    options=[
+                        {'label': '5日後預測', 'value': 5},
+                        {'label': '10日後預測', 'value': 10},
+                        {'label': '20日後預測', 'value': 20},
+                        {'label': '60日後預測', 'value': 60}
+                    ],
+                    value=5,
+                    style={'margin-bottom': '10px', 'color': '#272727'}
+                )
+            ], style={'width': '30%', 'display': 'inline-block'}),
+
+            html.Div(id='prediction-results', style={'width': '65%', 'display': 'inline-block', 'margin-left': '5%'})
+        ]),
+
+        html.Div([
+            dcc.Graph(id='prediction-chart')
+        ], style={'margin-top': '20px'})
+    ], style={
+        'background': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+        'padding': '25px',
+        'border-radius': '15px',
+        'box-shadow': '0 8px 25px rgba(0,0,0,0.15)',
+        'color': 'white'
+    })
+
+# 更新預測結果
+@app.callback(
+    [dash.dependencies.Output('prediction-results', 'children'),
+     dash.dependencies.Output('prediction-chart', 'figure')],
+    [dash.dependencies.Input('prediction-period', 'value'),
+     dash.dependencies.Input('stock-dropdown', 'value')]
+)
+def update_prediction(predict_days, selected_stock):
+    if selected_stock != 'TXF=F':
+        return html.Div(), {}
+
+    # 獲取台指期歷史資料
+    data = get_stock_data('^TWII', '2y')
+    if data.empty:
+        return html.Div("無法獲取台指期資料"), {}
+
+    # 執行預測
+    prediction = simple_lstm_predict(data, predict_days)
+    if prediction is None:
+        return html.Div("資料不足，無法進行預測"), {}
+
+    current_price = data['Close'].iloc[-1]
+    predicted_price = prediction['predicted_price']
+    change_pct = prediction['change_pct']
+    confidence = prediction['confidence']
+
+    # 預測結果卡片
+    color = '#00C851' if change_pct >= 0 else '#FF4444'
+    arrow = '📈' if change_pct >= 0 else '📉'
+
+    result_card = html.Div([
+        html.H4(f"{predict_days}日後預測結果", style={'margin': '0 0 15px 0', 'color': 'white'}),
+        html.Div([
+            html.Span(f"{arrow} ", style={'font-size': '24px'}),
+            html.Span(f"{change_pct:+.2f}%", style={
+                'font-size': '28px',
+                'font-weight': 'bold',
+                'color': color
+            })
+        ], style={'margin': '10px 0'}),
+        html.P(f"目前價格: {current_price:.2f}", style={'margin': '5px 0'}),
+        html.P(f"預測價格: {predicted_price:.2f}", style={'margin': '5px 0'}),
+        html.P(f"信心度: {confidence:.1%}", style={'margin': '5px 0', 'font-size': '14px'})
+    ], style={
+        'background': 'rgba(255,255,255,0.1)',
+        'padding': '20px',
+        'border-radius': '10px',
+        'border': '1px solid rgba(255,255,255,0.2)'
+    })
+
+    # 建立預測趨勢圖
+    fig = go.Figure()
+
+    # 歷史價格 (最近30天)
+    recent_data = data.tail(30)
+    fig.add_trace(go.Scatter(
+        x=recent_data.index,
+        y=recent_data['Close'],
+        mode='lines',
+        name='歷史價格',
+        line=dict(color='#FFA726', width=2)
+    ))
+
+    # 預測點
+    future_date = recent_data.index[-1] + timedelta(days=predict_days)
+    fig.add_trace(go.Scatter(
+        x=[recent_data.index[-1], future_date],
+        y=[current_price, predicted_price],
+        mode='lines+markers',
+        name=f'{predict_days}日預測',
+        line=dict(color=color, width=3, dash='dash'),
+        marker=dict(size=8)
+    ))
+
+    fig.update_layout(
+        title=f'台指期 {predict_days}日預測走勢',
+        xaxis_title='日期',
+        yaxis_title='指數點位',
+        height=350,
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='white')
+    )
+
+    return result_card, fig
+
+# 更新股價資訊卡片
+@app.callback(
+    dash.dependencies.Output('stock-info-cards', 'children'),
+    [dash.dependencies.Input('stock-dropdown', 'value')]
+)
+def update_stock_info(selected_stock):
+    data = get_stock_data(selected_stock, '5d')
+    if data.empty:
+        return html.Div("無法獲取股票資料")
+
+    current_price = data['Close'].iloc[-1]
+    prev_price = data['Close'].iloc[-2] if len(data) > 1 else current_price
+    change = current_price - prev_price
+    change_pct = (change / prev_price) * 100
+
+    # 找出股票中文名稱
+    stock_name = [name for name, symbol in TAIWAN_STOCKS.items() if symbol == selected_stock][0]
+
+    color = 'green' if change >= 0 else 'red'
+
+    return html.Div([
+        html.Div([
+            html.H3(f"{stock_name} ({selected_stock})", style={'margin': '0'}),
+            html.H2(f"${current_price:.2f}", style={'margin': '5px 0', 'color': color}),
+            html.P(f"{'▲' if change >= 0 else '▼'} {change:+.2f} ({change_pct:+.2f}%)",
+                   style={'margin': '0', 'color': color, 'font-weight': 'bold'})
+        ], style={
+            'background': 'white',
+            'padding': '20px',
+            'border-radius': '10px',
+            'box-shadow': '0 2px 10px rgba(0,0,0,0.1)',
+            'display': 'inline-block',
+            'margin-right': '20px'
+        }),
+
+        html.Div([
+            html.H4("今日統計", style={'margin': '0 0 10px 0'}),
+            html.P(f"最高: ${data['High'].iloc[-1]:.2f}", style={'margin': '5px 0'}),
+            html.P(f"最低: ${data['Low'].iloc[-1]:.2f}", style={'margin': '5px 0'}),
+            html.P(f"成交量: {data['Volume'].iloc[-1]:,.0f}", style={'margin': '5px 0'})
+        ], style={
+            'background': 'white',
+            'padding': '20px',
+            'border-radius': '10px',
+            'box-shadow': '0 2px 10px rgba(0,0,0,0.1)',
+            'display': 'inline-block'
+        })
+    ])
+
+# 更新股價圖表
+@app.callback(
+    dash.dependencies.Output('price-chart', 'figure'),
+    [dash.dependencies.Input('stock-dropdown', 'value'),
+     dash.dependencies.Input('period-dropdown', 'value'),
+     dash.dependencies.Input('chart-type', 'value')]
+)
+def update_price_chart(selected_stock, period, chart_type):
+    data = get_stock_data(selected_stock, period)
+    if data.empty:
+        return {}
+
+    data = calculate_technical_indicators(data)
+    stock_name = [name for name, symbol in TAIWAN_STOCKS.items() if symbol == selected_stock][0]
+
+    if chart_type == 'candlestick':
+        fig = go.Figure(data=go.Candlestick(
+            x=data.index,
+            open=data['Open'],
+            high=data['High'],
+            low=data['Low'],
+            close=data['Close'],
+            name=stock_name
+        ))
+    else:
+        fig = px.line(data, y='Close', title=f'{stock_name} 股價走勢')
+
+    # 添加移動平均線
+    fig.add_trace(go.Scatter(x=data.index, y=data['MA5'], mode='lines', name='MA5', line=dict(color='orange')))
+    fig.add_trace(go.Scatter(x=data.index, y=data['MA20'], mode='lines', name='MA20', line=dict(color='blue')))
+
+    fig.update_layout(
+        title=f'{stock_name} 股價走勢',
+        xaxis_title='日期',
+        yaxis_title='價格 (TWD)',
+        height=400
+    )
+
+    return fig
+
+# 更新RSI圖表（保持兼容性）
+@app.callback(
+    dash.dependencies.Output('rsi-chart', 'figure'),
+    [dash.dependencies.Input('stock-dropdown', 'value'),
+     dash.dependencies.Input('period-dropdown', 'value')]
+)
+def update_rsi_chart(selected_stock, period):
+    data = get_stock_data(selected_stock, period)
+    if data.empty:
+        return {}
+
+    data = calculate_technical_indicators(data)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=data.index, y=data['RSI'], mode='lines', name='RSI', line=dict(color='purple', width=2)))
+    fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="超買線(70)")
+    fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="超賣線(30)")
+    fig.add_hline(y=50, line_dash="dot", line_color="gray", annotation_text="中線(50)")
+
+    # 添加超買超賣區域背景
+    fig.add_hrect(y0=70, y1=100, fillcolor="red", opacity=0.1, annotation_text="超買區")
+    fig.add_hrect(y0=0, y1=30, fillcolor="green", opacity=0.1, annotation_text="超賣區")
+
+    fig.update_layout(
+        title='RSI 相對強弱指標',
+        xaxis_title='日期',
+        yaxis_title='RSI',
+        height=400,
+        yaxis=dict(range=[0, 100])
+    )
+
+    return fig
+
+# 新增：進階技術指標圖表
+@app.callback(
+    dash.dependencies.Output('advanced-technical-chart', 'figure'),
+    [dash.dependencies.Input('technical-indicator-selector', 'value'),
+     dash.dependencies.Input('stock-dropdown', 'value'),
+     dash.dependencies.Input('period-dropdown', 'value')]
+)
+def update_advanced_technical_chart(indicator, selected_stock, period):
+    data = get_stock_data(selected_stock, period)
+    if data.empty:
+        return {}
+
+    data = calculate_technical_indicators(data)
+    stock_name = [name for name, symbol in TAIWAN_STOCKS.items() if symbol == selected_stock][0]
+
+    if indicator == 'RSI':
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=data.index, y=data['RSI'], mode='lines', name='RSI', line=dict(color='purple', width=2)))
+        fig.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="超買線(70)")
+        fig.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="超賣線(30)")
+        fig.add_hline(y=50, line_dash="dot", line_color="gray", annotation_text="中線(50)")
+
+        fig.add_hrect(y0=70, y1=100, fillcolor="red", opacity=0.1)
+        fig.add_hrect(y0=0, y1=30, fillcolor="green", opacity=0.1)
+
+        fig.update_layout(
+            title=f'{stock_name} - RSI 相對強弱指標',
+            xaxis_title='日期',
+            yaxis_title='RSI',
+            height=450,
+            yaxis=dict(range=[0, 100])
+        )
+
+    elif indicator == 'MACD':
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                           vertical_spacing=0.1,
+                           row_heights=[0.7, 0.3],
+                           subplot_titles=('價格與MACD線', 'MACD柱狀圖'))
+
+        # 上方：價格線
+        fig.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name='收盤價',
+                                line=dict(color='black', width=1)), row=1, col=1)
+
+        # MACD線和信號線
+        fig.add_trace(go.Scatter(x=data.index, y=data['MACD'], mode='lines', name='MACD',
+                                line=dict(color='blue', width=2)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=data.index, y=data['MACD_Signal'], mode='lines', name='信號線',
+                                line=dict(color='red', width=2)), row=1, col=1)
+
+        # 下方：MACD柱狀圖
+        colors = ['green' if x >= 0 else 'red' for x in data['MACD_Histogram']]
+        fig.add_trace(go.Bar(x=data.index, y=data['MACD_Histogram'], name='MACD柱狀圖',
+                            marker_color=colors), row=2, col=1)
+
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", row=1, col=1)
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
+
+        fig.update_layout(
+            title=f'{stock_name} - MACD 指數平滑異同移動平均線',
+            height=500
+        )
+
+    elif indicator == 'BB':
+        fig = go.Figure()
+
+        # 價格線
+        fig.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name='收盤價',
+                                line=dict(color='black', width=2)))
+
+        # 布林通道上軌
+        fig.add_trace(go.Scatter(x=data.index, y=data['BB_Upper'], mode='lines', name='上軌',
+                                line=dict(color='red', width=1, dash='dash')))
+
+        # 布林通道中軌
+        fig.add_trace(go.Scatter(x=data.index, y=data['BB_Middle'], mode='lines', name='中軌(MA20)',
+                                line=dict(color='blue', width=1)))
+
+        # 布林通道下軌
+        fig.add_trace(go.Scatter(x=data.index, y=data['BB_Lower'], mode='lines', name='下軌',
+                                line=dict(color='green', width=1, dash='dash')))
+
+        # 填充通道區域
+        fig.add_trace(go.Scatter(x=data.index, y=data['BB_Upper'], mode='lines',
+                                line=dict(color='rgba(0,0,0,0)'), showlegend=False))
+        fig.add_trace(go.Scatter(x=data.index, y=data['BB_Lower'], mode='lines',
+                                fill='tonexty', fillcolor='rgba(173,216,230,0.2)',
+                                line=dict(color='rgba(0,0,0,0)'), name='布林通道', showlegend=False))
+
+        fig.update_layout(
+            title=f'{stock_name} - 布林通道 (20日, 2σ)',
+            xaxis_title='日期',
+            yaxis_title='價格 (TWD)',
+            height=450
+        )
+
+    elif indicator == 'KD':
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                           vertical_spacing=0.1,
+                           row_heights=[0.6, 0.4],
+                           subplot_titles=('價格走勢', 'KD指標'))
+
+        # 上方：價格線
+        fig.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name='收盤價',
+                                line=dict(color='black', width=1)), row=1, col=1)
+
+        # 下方：KD線
+        fig.add_trace(go.Scatter(x=data.index, y=data['K'], mode='lines', name='K線',
+                                line=dict(color='blue', width=2)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=data.index, y=data['D'], mode='lines', name='D線',
+                                line=dict(color='red', width=2)), row=2, col=1)
+
+        # KD指標參考線
+        fig.add_hline(y=80, line_dash="dash", line_color="red", annotation_text="超買線(80)", row=2, col=1)
+        fig.add_hline(y=20, line_dash="dash", line_color="green", annotation_text="超賣線(20)", row=2, col=1)
+        fig.add_hline(y=50, line_dash="dot", line_color="gray", annotation_text="中線(50)", row=2, col=1)
+
+        # 超買超賣區域
+        fig.add_hrect(y0=80, y1=100, fillcolor="red", opacity=0.1, row=2, col=1)
+        fig.add_hrect(y0=0, y1=20, fillcolor="green", opacity=0.1, row=2, col=1)
+
+        fig.update_layout(
+            title=f'{stock_name} - KD 隨機指標 (9,3,3)',
+            height=500
+        )
+        fig.update_yaxes(range=[0, 100], row=2, col=1)
+
+    elif indicator == 'WR':
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                           vertical_spacing=0.1,
+                           row_heights=[0.6, 0.4],
+                           subplot_titles=('價格走勢', '威廉指標 %R'))
+
+        # 上方：價格線
+        fig.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name='收盤價',
+                                line=dict(color='black', width=1)), row=1, col=1)
+
+        # 下方：威廉指標
+        fig.add_trace(go.Scatter(x=data.index, y=data['Williams_R'], mode='lines', name='威廉%R',
+                                line=dict(color='purple', width=2)), row=2, col=1)
+
+        # 威廉指標參考線
+        fig.add_hline(y=-20, line_dash="dash", line_color="red", annotation_text="超買線(-20)", row=2, col=1)
+        fig.add_hline(y=-80, line_dash="dash", line_color="green", annotation_text="超賣線(-80)", row=2, col=1)
+        fig.add_hline(y=-50, line_dash="dot", line_color="gray", annotation_text="中線(-50)", row=2, col=1)
+
+        # 超買超賣區域
+        fig.add_hrect(y0=-20, y1=0, fillcolor="red", opacity=0.1, row=2, col=1)
+        fig.add_hrect(y0=-100, y1=-80, fillcolor="green", opacity=0.1, row=2, col=1)
+
+        fig.update_layout(
+            title=f'{stock_name} - 威廉指標 %R (14日)',
+            height=500
+        )
+        fig.update_yaxes(range=[-100, 0], row=2, col=1)
+
+    return fig
+
+# 更新成交量圖表
+@app.callback(
+    dash.dependencies.Output('volume-chart', 'figure'),
+    [dash.dependencies.Input('stock-dropdown', 'value'),
+     dash.dependencies.Input('period-dropdown', 'value')]
+)
+def update_volume_chart(selected_stock, period):
+    data = get_stock_data(selected_stock, period)
+    if data.empty:
+        return {}
+
+    stock_name = [name for name, symbol in TAIWAN_STOCKS.items() if symbol == selected_stock][0]
+
+    fig = px.bar(data, y='Volume', title=f'{stock_name} 成交量')
+    fig.update_layout(
+        xaxis_title='日期',
+        yaxis_title='成交量',
+        height=300
+    )
+
+    return fig
+
+# 更新產業分析圖表
+@app.callback(
+    dash.dependencies.Output('industry-analysis', 'figure'),
+    [dash.dependencies.Input('stock-dropdown', 'value')]
+)
+def update_industry_analysis(selected_stock):
+    # 獲取多檔股票資料進行產業比較
+    industry_data = []
+
+    for symbol in list(TAIWAN_STOCKS.values())[:10]:  # 取前10檔做示範
+        data = get_stock_data(symbol, '1mo')
+        if not data.empty:
+            stock_name = [name for name, symbol_code in TAIWAN_STOCKS.items() if symbol_code == symbol][0]
+            latest_price = data['Close'].iloc[-1]
+            first_price = data['Close'].iloc[0]
+            return_pct = ((latest_price - first_price) / first_price) * 100
+
+            industry_data.append({
+                '股票': stock_name,
+                '代碼': symbol,
+                '月報酬率(%)': return_pct,
+                '產業': INDUSTRY_MAPPING.get(symbol, '其他')
+            })
+
+    if not industry_data:
+        return {}
+
+    df_industry = pd.DataFrame(industry_data)
+
+    # 建立產業表現圓餅圖
+    fig = px.pie(df_industry, values='月報酬率(%)', names='股票',
+                title='各股票月報酬率比較',
+                color_discrete_sequence=px.colors.qualitative.Set3)
+
+    fig.update_layout(height=400)
+    return fig
+
+# 新增：更新景氣燈號圖表
+@app.callback(
+    dash.dependencies.Output('business-climate-chart', 'figure'),
+    [dash.dependencies.Input('stock-dropdown', 'value')]  # 雖然不會影響圖表，但需要觸發
+)
+def update_business_climate_chart(selected_stock):
+    df = get_business_climate_data()
+
+    if df.empty:
+        # 如果沒有資料，顯示提示圖表
+        fig = go.Figure()
+        fig.add_annotation(
+            x=0.5, y=0.5,
+            text="無法載入景氣燈號資料<br>請確認 business_climate.csv 檔案是否存在",
+            xref="paper", yref="paper",
+            showarrow=False,
+            font=dict(size=14)
+        )
+        fig.update_layout(
+            title="台灣景氣燈號",
+            height=300,
+            showlegend=False
+        )
+        return fig
+
+    # 定義燈號顏色
+    def get_light_color(score):
+        if score >= 32:
+            return 'red'      # 紅燈
+        elif score >= 24:
+            return 'orange'   # 黃紅燈
+        elif score >= 17:
+            return 'yellow'   # 黃燈
+        elif score >= 10:
+            return 'lightgreen'  # 黃藍燈
+        else:
+            return 'blue'     # 藍燈
+
+    # 為每個點設定顏色
+    colors = [get_light_color(score) for score in df['Index']]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=df['Date'],
+        y=df['Index'],
+        mode='lines+markers',
+        name='景氣燈號',
+        line=dict(color='darkblue', width=2),
+        marker=dict(
+            size=8,
+            color=colors,
+            line=dict(width=2, color='darkblue')
+        )
+    ))
+
+    # 添加燈號區間線
+    fig.add_hline(y=32, line_dash="dash", line_color="red", annotation_text="紅燈(32)")
+    fig.add_hline(y=24, line_dash="dash", line_color="orange", annotation_text="黃紅燈(24)")
+    fig.add_hline(y=17, line_dash="dash", line_color="yellow", annotation_text="黃燈(17)")
+    fig.add_hline(y=10, line_dash="dash", line_color="lightgreen", annotation_text="黃藍燈(10)")
+
+    fig.update_layout(
+        title="台灣景氣燈號走勢",
+        xaxis_title='日期',
+        yaxis_title='燈號分數',
+        height=300,
+        yaxis=dict(range=[0, 40])
+    )
+
+    return fig
+
+# 新增：更新分析師觀點
+@app.callback(
+    [dash.dependencies.Output('technical-analysis-text', 'children'),
+     dash.dependencies.Output('fundamental-analysis-text', 'children'),
+     dash.dependencies.Output('market-outlook-text', 'children')],
+    [dash.dependencies.Input('stock-dropdown', 'value'),
+     dash.dependencies.Input('period-dropdown', 'value')]
+)
+def update_analysis_text(selected_stock, period):
+    # 獲取股票資料進行分析
+    data = get_stock_data(selected_stock, period)
+    stock_name = [name for name, symbol in TAIWAN_STOCKS.items() if symbol == selected_stock][0]
+
+    if data.empty:
+        return "無法獲取資料進行分析", "無法獲取資料進行分析", "無法獲取資料進行分析"
+
+    # 計算技術指標
+    data = calculate_technical_indicators(data)
+
+    # 基本數據
+    current_price = data['Close'].iloc[-1]
+    price_change = ((current_price - data['Close'].iloc[0]) / data['Close'].iloc[0]) * 100
+    volume_avg = data['Volume'].mean()
+    recent_volume = data['Volume'].iloc[-5:].mean()
+    rsi_current = data['RSI'].iloc[-1] if not pd.isna(data['RSI'].iloc[-1]) else 50
+
+    # 新增技術指標數據
+    macd_current = data['MACD'].iloc[-1] if not pd.isna(data['MACD'].iloc[-1]) else 0
+    macd_signal_current = data['MACD_Signal'].iloc[-1] if not pd.isna(data['MACD_Signal'].iloc[-1]) else 0
+    bb_position = data['BB_Position'].iloc[-1] if not pd.isna(data['BB_Position'].iloc[-1]) else 0.5
+    k_current = data['K'].iloc[-1] if not pd.isna(data['K'].iloc[-1]) else 50
+    d_current = data['D'].iloc[-1] if not pd.isna(data['D'].iloc[-1]) else 50
+
+    # 技術面分析
+    technical_text = html.Div([
+        html.P([
+            html.Strong("價格趨勢："),
+            f"近期{period}期間內，{stock_name}呈現",
+            html.Span(f"{'上漲' if price_change > 5 else '下跌' if price_change < -5 else '盤整'}",
+                     style={'color': 'green' if price_change > 5 else 'red' if price_change < -5 else 'orange', 'font-weight': 'bold'}),
+            f"走勢，累計變動{price_change:+.1f}%。"
+        ]),
+        html.P([
+            html.Strong("RSI指標："),
+            f"目前為{rsi_current:.1f}，",
+            html.Span(
+                "處於超買區間" if rsi_current > 70 else "處於超賣區間" if rsi_current < 30 else "在正常範圍內",
+                style={'color': 'red' if rsi_current > 70 else 'green' if rsi_current < 30 else 'blue', 'font-weight': 'bold'}
+            ),
+            "。"
+        ]),
+        html.P([
+            html.Strong("MACD指標："),
+            f"MACD線({macd_current:.3f})",
+            html.Span(
+                "高於" if macd_current > macd_signal_current else "低於",
+                style={'color': 'green' if macd_current > macd_signal_current else 'red', 'font-weight': 'bold'}
+            ),
+            f"信號線({macd_signal_current:.3f})，",
+            f"顯示{'多頭' if macd_current > macd_signal_current else '空頭'}格局。"
+        ]),
+        html.P([
+            html.Strong("布林通道："),
+            f"股價位於通道",
+            html.Span(
+                "上半部" if bb_position > 0.8 else "下半部" if bb_position < 0.2 else "中段",
+                style={'color': 'red' if bb_position > 0.8 else 'green' if bb_position < 0.2 else 'blue', 'font-weight': 'bold'}
+            ),
+            f"({bb_position*100:.0f}%)，",
+            f"{'壓力較大' if bb_position > 0.8 else '支撐較強' if bb_position < 0.2 else '整理格局'}。"
+        ]),
+        html.P([
+            html.Strong("KD指標："),
+            f"K值({k_current:.1f})",
+            html.Span(
+                "高於" if k_current > d_current else "低於",
+                style={'color': 'green' if k_current > d_current else 'red', 'font-weight': 'bold'}
+            ),
+            f"D值({d_current:.1f})，",
+            html.Span(
+                "超買警戒" if k_current > 80 else "超賣關注" if k_current < 20 else "正常區間",
+                style={'color': 'red' if k_current > 80 else 'green' if k_current < 20 else 'blue', 'font-weight': 'bold'}
+            ),
+            "。"
+        ]),
+        html.P([
+            html.Strong("成交量分析："),
+            f"近期成交量{'放大' if recent_volume > volume_avg * 1.2 else '萎縮' if recent_volume < volume_avg * 0.8 else '平穩'}，",
+            f"顯示市場{'關注度提升' if recent_volume > volume_avg * 1.2 else '觀望氣氛濃厚' if recent_volume < volume_avg * 0.8 else '交投正常'}。"
+        ])
+    ])
+
+    # 基本面分析
+    industry = INDUSTRY_MAPPING.get(selected_stock, '綜合')
+    if selected_stock == 'TXF=F':
+        fundamental_text = html.Div([
+            html.P([
+                html.Strong("總體經濟："),
+                "台指期反映台股整體表現，當前需關注聯準會政策、國際貿易情勢及台灣出口動能。"
+            ]),
+            html.P([
+                html.Strong("產業輪動："),
+                "觀察半導體、電子等權重產業表現，以及傳統產業復甦力道。"
+            ]),
+            html.P([
+                html.Strong("資金面："),
+                "外資動向、匯率變化及市場流動性為主要觀察重點。"
+            ])
+        ])
+    else:
+        fundamental_text = html.Div([
+            html.P([
+                html.Strong("產業地位："),
+                f"{stock_name}屬於{industry}產業，在產業鏈中具有",
+                html.Span("重要地位" if selected_stock in ['2330.TW', '2454.TW', '2317.TW'] else "一定影響力",
+                         style={'font-weight': 'bold'}),
+                "。"
+            ]),
+            html.P([
+                html.Strong("營運展望："),
+                f"考量{industry}產業前景及公司基本面，建議持續關注季報表現及未來指引。"
+            ]),
+            html.P([
+                html.Strong("風險評估："),
+                "注意產業週期性變化、國際競爭及法規環境變化等風險因子。"
+            ])
+        ])
+
+    # 市場展望
+    if price_change > 10:
+        outlook_tone = "謹慎樂觀"
+        outlook_color = "#28a745"
+    elif price_change < -10:
+        outlook_tone = "保守觀望"
+        outlook_color = "#dc3545"
+    else:
+        outlook_tone = "中性持平"
+        outlook_color = "#ffc107"
+
+    market_outlook = html.Div([
+        html.P([
+            html.Strong("整體評估：", style={'font-size': '16px'}),
+            f"基於技術面及基本面分析，對{stock_name}採取",
+            html.Span(f"{outlook_tone}", style={'color': outlook_color, 'font-weight': 'bold', 'font-size': '16px'}),
+            "態度。"
+        ]),
+        html.P([
+            html.Strong("投資建議："),
+            "建議投資人根據自身風險承受能力，採取適當的資產配置策略。短線操作注意技術指標，長線投資關注基本面變化。"
+        ]),
+        html.P([
+            html.Strong("風險提醒："),
+            "股票投資具有風險，過去績效不代表未來表現，投資前請詳閱公開說明書並審慎評估。"
+        ], style={'font-style': 'italic', 'font-size': '13px'})
+    ])
+
+    return technical_text, fundamental_text, market_outlook
+
+# 新增：更新PMI圖表
+@app.callback(
+    dash.dependencies.Output('pmi-chart', 'figure'),
+    [dash.dependencies.Input('stock-dropdown', 'value')]  # 雖然不會影響圖表，但需要觸發
+)
+def update_pmi_chart(selected_stock):
+    df = get_pmi_data()
+
+    if df.empty:
+        # 如果沒有資料，顯示提示圖表
+        fig = go.Figure()
+        fig.add_annotation(
+            x=0.5, y=0.5,
+            text="無法載入PMI資料<br>請確認 taiwan_pmi.csv 檔案是否存在",
+            xref="paper", yref="paper",
+            showarrow=False,
+            font=dict(size=14)
+        )
+        fig.update_layout(
+            title="台灣PMI指數",
+            height=300,
+            showlegend=False
+        )
+        return fig
+
+    # 定義PMI顏色 (50以上擴張，以下緊縮)
+    def get_pmi_color(value):
+        return 'green' if value >= 50 else 'red'
+
+    colors = [get_pmi_color(value) for value in df['Index']]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=df['Date'],
+        y=df['Index'],
+        mode='lines+markers',
+        name='PMI指數',
+        line=dict(color='darkblue', width=2),
+        marker=dict(
+            size=8,
+            color=colors,
+            line=dict(width=2, color='darkblue')
+        )
+    ))
+
+    # 添加榮枯線
+    fig.add_hline(y=50, line_dash="dash", line_color="black", annotation_text="榮枯線(50)")
+
+    # 添加背景色區域
+    fig.add_hrect(
+        y0=50, y1=60,
+        fillcolor="lightgreen", opacity=0.2,
+        annotation_text="擴張區間", annotation_position="top left"
+    )
+    fig.add_hrect(
+        y0=40, y1=50,
+        fillcolor="lightcoral", opacity=0.2,
+        annotation_text="緊縮區間", annotation_position="bottom left"
+    )
+
+    fig.update_layout(
+        title="台灣PMI指數走勢",
+        xaxis_title='日期',
+        yaxis_title='PMI指數',
+        height=300,
+        yaxis=dict(range=[35, 60])
+    )
+
+    return fig
+
+# 新增：多檔股票比較
+@app.callback(
+    [dash.dependencies.Output('comparison-chart', 'figure'),
+     dash.dependencies.Output('comparison-table', 'children')],
+    [dash.dependencies.Input('comparison-stocks', 'value'),
+     dash.dependencies.Input('comparison-period', 'value')]
+)
+def update_comparison_analysis(selected_stocks, period):
+    if not selected_stocks:
+        return {}, html.Div("請選擇要比較的股票")
+
+    # 限制最多5檔
+    selected_stocks = selected_stocks[:5]
+
+    fig = go.Figure()
+    comparison_data = []
+
+    for stock in selected_stocks:
+        data = get_stock_data(stock, period)
+        if not data.empty:
+            stock_name = [name for name, symbol in TAIWAN_STOCKS.items() if symbol == stock][0]
+
+            # 正規化價格（以期初為基準100）
+            normalized_prices = (data['Close'] / data['Close'].iloc[0]) * 100
+
+            fig.add_trace(go.Scatter(
+                x=data.index,
+                y=normalized_prices,
+                mode='lines',
+                name=stock_name,
+                line=dict(width=2)
+            ))
+
+            # 計算績效數據
+            total_return = ((data['Close'].iloc[-1] / data['Close'].iloc[0]) - 1) * 100
+            volatility = data['Close'].pct_change().std() * np.sqrt(252) * 100  # 年化波動率
+
+            comparison_data.append({
+                'name': stock_name,
+                'return': total_return,
+                'volatility': volatility,
+                'current_price': data['Close'].iloc[-1]
+            })
+
+    fig.update_layout(
+        title=f'股票績效比較 - {period}',
+        xaxis_title='日期',
+        yaxis_title='相對績效 (基期=100)',
+        height=400,
+        hovermode='x unified'
+    )
+
+    # 建立比較表格
+    if comparison_data:
+        table_rows = []
+        for item in sorted(comparison_data, key=lambda x: x['return'], reverse=True):
+            color = 'green' if item['return'] > 0 else 'red'
+            table_rows.append(
+                html.Tr([
+                    html.Td(item['name'], style={'font-weight': 'bold'}),
+                    html.Td(f"{item['return']:+.1f}%", style={'color': color, 'font-weight': 'bold'}),
+                    html.Td(f"{item['volatility']:.1f}%"),
+                    html.Td(f"${item['current_price']:.2f}")
+                ])
+            )
+
+        table = html.Table([
+            html.Thead([
+                html.Tr([
+                    html.Th("股票", style={'text-align': 'center'}),
+                    html.Th("報酬率", style={'text-align': 'center'}),
+                    html.Th("波動率", style={'text-align': 'center'}),
+                    html.Th("現價", style={'text-align': 'center'})
+                ])
+            ]),
+            html.Tbody(table_rows)
+        ], style={
+            'width': '100%',
+            'border-collapse': 'collapse',
+            'font-size': '12px'
+        })
+
+        return fig, table
+
+    return fig, html.Div("無可比較資料")
+
+# 新增：市場情緒分析
+@app.callback(
+    [dash.dependencies.Output('sentiment-gauge', 'children'),
+     dash.dependencies.Output('news-summary', 'children')],
+    [dash.dependencies.Input('stock-dropdown', 'value')]
+)
+def update_sentiment_analysis(selected_stock):
+    # 模擬情緒指標（實際應用中可接入新聞API或情緒分析服務）
+    sentiment_score = np.random.uniform(30, 80)  # 模擬情緒分數 0-100
+
+    # 建立情緒指標圓形圖
+    gauge_fig = go.Figure(go.Indicator(
+        mode = "gauge+number+delta",
+        value = sentiment_score,
+        domain = {'x': [0, 1], 'y': [0, 1]},
+        title = {'text': "市場情緒指數"},
+        delta = {'reference': 50},
+        gauge = {
+            'axis': {'range': [None, 100]},
+            'bar': {'color': "darkblue"},
+            'steps': [
+                {'range': [0, 30], 'color': "lightcoral"},
+                {'range': [30, 70], 'color': "lightgray"},
+                {'range': [70, 100], 'color': "lightgreen"}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': 90
+            }
+        }
+    ))
+
+    gauge_fig.update_layout(height=200, margin=dict(l=20, r=20, t=40, b=20))
+
+    # 模擬新聞摘要
+    stock_name = [name for name, symbol in TAIWAN_STOCKS.items() if symbol == selected_stock][0]
+
+    news_items = [
+        f"📈 {stock_name}獲外資調升目標價，看好後續發展前景",
+        f"💼 法人預期{stock_name}下季營收將較上季成長5-10%",
+        f"🌐 國際市場波動對{stock_name}影響有限，基本面穩健",
+        f"⚡ 產業景氣回溫，{stock_name}受惠程度值得關注",
+        f"📊 技術面顯示{stock_name}突破關鍵壓力，短線偏多"
+    ]
+
+    news_content = html.Div([
+        html.P(news, style={
+            'margin': '8px 0',
+            'padding': '8px',
+            'background': '#e8f4f8',
+            'border-radius': '5px',
+            'border-left': '3px solid #17a2b8',
+            'font-size': '13px'
+        }) for news in news_items[:3]  # 顯示前3條
+    ])
+
+    return dcc.Graph(figure=gauge_fig), news_content
+
+# 在 Colab 中執行的設定
+if __name__ == '__main__':
+    # 在執行前先測試檔案讀取
+    print("測試檔案讀取...")
+    business_data = get_business_climate_data()
+    pmi_data = get_pmi_data()
+
+    if not business_data.empty:
+        print(f"景氣燈號資料預覽：\n{business_data.head()}")
+    if not pmi_data.empty:
+        print(f"PMI資料預覽：\n{pmi_data.head()}")
+
+    # 在 Colab 中需要使用以下方式啟動
+    app.run(mode='inline', port=8050, debug=True)
+
+    # 如果在本地環境執行，使用以下方式
+    # app.run_server(debug=True)
+
+# 使用說明：
+"""
+在 Google Colab 中執行此程式的步驟：
+
+1. 首先安裝必要套件：
+   !pip install dash plotly yfinance pandas numpy
+
+2. 確保你的 CSV 檔案格式正確：
+   - business_climate.csv: 包含 Date 和 Index 兩欄
+   - taiwan_pmi.csv: 包含 DATE 和 INDEX 兩欄 (或 Date 和 Index)
+   - 日期格式建議為 YYYY-MM (例如: 2023-07)
+
+3. 將 CSV 檔案上傳到 Colab 的檔案區域，確保檔名正確
+
+4. 將上述程式碼貼到 Colab cell 中執行
+
+5. 程式會先測試檔案讀取，然後啟動儀表板
+
+修正內容：
+- 新增了 os 模組來檢查檔案是否存在
+- 改善了 CSV 檔案讀取函數，加入錯誤處理和格式檢查
+- 新增了景氣燈號和 PMI 圖表的回調函數
+- 修正了 dash.Output 的語法（使用 dash.dependencies.Output）
+- 加入了日期格式處理，支援 YYYY-MM 格式
+- 新增了檔案讀取測試功能
+
+如果仍有問題，請檢查：
+1. CSV 檔案是否在正確位置
+2. 檔案格式是否正確
+3. 日期欄位是否包含有效日期
+"""
